@@ -94,6 +94,11 @@
     text-shadow: 0 1px 2px rgba(0,0,0,.35);
   }
   .pin.nearby { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .bolt {
+    transform: translate(-50%, -50%);
+    font-size: 22px; line-height: 1;
+    filter: drop-shadow(0 0 2px #000) drop-shadow(0 0 3px #facc15);
+  }
 
   @media (min-width: 900px) {
     main { flex-direction: row; }
@@ -107,8 +112,8 @@
 <header>
   <h1>SG Air Quality</h1>
   <div class="segmented" role="tablist">
-    <button id="modeTemp" class="active" data-mode="temp">Temp</button>
-    <button id="modePm25" data-mode="pm25">PM2.5</button>
+    <button id="modeTemp" data-mode="temp">Temp</button>
+    <button id="modePm25" class="active" data-mode="pm25">PM2.5</button>
   </div>
   <div id="status">Loading…</div>
   <button id="locateBtn" class="primary" disabled>Near me</button>
@@ -150,7 +155,7 @@ const REFRESH_MS = 5 * 60 * 1000;
 
 // ---------- State ----------
 const stations = { temp: [], pm25: [] };   // each: [{ id, name, lat, lng, value, timestamp }]
-let mode = "temp";
+let mode = "pm25";
 let userLatLng = null;
 let userMarker = null;
 let pinLayer;
@@ -240,6 +245,86 @@ async function fetchDataset(url) {
     result.push({ id, name: info.name, lat: info.lat, lng: info.lng, value: reading.value, timestamp: reading.timestamp });
   }
   return result;
+}
+
+// PM2.5 is published per region (north, south, east, west, central), not per station.
+// Each region is placed at its labelLocation so it can be drawn and ranked like a station.
+async function fetchPm25(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const json = await res.json();
+  if (json.code !== 0) throw new Error(json.errorMsg || "API returned an error");
+
+  const data = json.data || {};
+  const locations = new Map((data.regionMetadata || []).map(r => [r.name, r.labelLocation]));
+  const item = (data.items || [])[0];          // latest item
+  const values = item?.readings?.pm25_one_hourly || {};
+
+  const result = [];
+  for (const [name, value] of Object.entries(values)) {
+    const loc = locations.get(name);
+    if (!loc || value == null || Number.isNaN(Number(value))) continue;
+    result.push({
+      id: name,
+      name: `${name.charAt(0).toUpperCase()}${name.slice(1)} region`,
+      lat: Number(loc.latitude),
+      lng: Number(loc.longitude),
+      value: Number(value),
+      timestamp: item.timestamp,
+    });
+  }
+  return result;
+}
+
+// Lightning feed: data.records[].item.readings[] (empty when no strikes are detected).
+// Accepts several common location field layouts since strike records may vary.
+const LIGHTNING_URL = "https://api-open.data.gov.sg/v2/real-time/api/weather?api=lightning";
+async function fetchLightning(url) {
+  const result = [];
+  let token = null;
+
+  do {
+    const u = new URL(url);
+    if (token) u.searchParams.set("paginationToken", token);
+
+    const res = await fetch(u);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const json = await res.json();
+    if (json.code !== 0) throw new Error(json.errorMsg || "API returned an error");
+
+    for (const rec of json.data?.records || []) {
+      for (const r of rec.item?.readings || []) {
+        // Schema: location.latitude / location.longitude are strings; datetime is per reading
+        const lat = Number(r.location?.latitude);
+        const lng = Number(r.location?.longitude);
+        if (!r.location || Number.isNaN(lat) || Number.isNaN(lng)) continue;
+        result.push({
+          lat,
+          lng,
+          timestamp: r.datetime ?? rec.datetime,
+          type: r.type,        // "C" = cloud to cloud, "G" = cloud to ground
+          text: r.text,
+        });
+      }
+    }
+    token = json.data?.paginationToken || null;
+  } while (token);
+
+  return result;
+}
+
+// ---------- Lightning rendering ----------
+let lightning = [];
+let lightningLayer;
+
+function renderLightning() {
+  lightningLayer.clearLayers();
+  for (const s of lightning) {
+    const icon = L.divIcon({ className: "", html: `<div class="bolt">⚡</div>`, iconSize: null });
+    L.marker([s.lat, s.lng], { icon, title: "Lightning detected", zIndexOffset: 1000 })
+      .bindPopup(`<strong>Lightning detected</strong>${s.text ? `<br>${escapeHtml(s.text)}` : ""}<br>${new Date(s.timestamp).toLocaleTimeString()}`)
+      .addTo(lightningLayer);
+  }
 }
 
 // ---------- Map rendering ----------
@@ -375,13 +460,26 @@ function locateUser(auto = false) {
 async function refreshReadings() {
   setStatus("Refreshing readings…");
   const keys = Object.keys(DATASETS);
-  const results = await Promise.allSettled(keys.map(k => fetchDataset(DATASETS[k].url)));
+  const fetchers = {
+    temp: () => fetchDataset(DATASETS.temp.url),   // station-based
+    pm25: () => fetchPm25(DATASETS.pm25.url),      // region-based
+  };
+  const results = await Promise.allSettled(keys.map(k => fetchers[k]()));
 
   const failures = [];
   results.forEach((r, i) => {
     if (r.status === "fulfilled") stations[keys[i]] = r.value;
     else { console.error(r.reason); failures.push(`${DATASETS[keys[i]].label}: ${r.reason.message}`); }
   });
+
+  try {
+    lightning = await fetchLightning(LIGHTNING_URL);
+  } catch (err) {
+    console.error(err);
+    lightning = [];
+    failures.push(`Lightning: ${err.message}`);
+  }
+  renderLightning();
 
   render();
   const counts = keys.map(k => `${stations[k].length} ${DATASETS[k].label}`).join(" · ");
@@ -409,6 +507,7 @@ function init() {
 
   map.fitBounds(SG_BOUNDS);
   pinLayer = L.layerGroup().addTo(map);
+  lightningLayer = L.layerGroup().addTo(map);
 
   document.querySelectorAll(".segmented button").forEach(b => {
     b.addEventListener("click", () => setMode(b.dataset.mode));
