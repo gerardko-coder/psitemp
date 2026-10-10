@@ -114,6 +114,7 @@
   <div class="segmented" role="tablist">
     <button id="modeTemp" data-mode="temp">Temp</button>
     <button id="modePm25" class="active" data-mode="pm25">PM2.5</button>
+    <button id="modeRain" data-mode="rain">Rain</button>
   </div>
   <div id="status">Loading…</div>
   <button id="locateBtn" class="primary" disabled>Near me</button>
@@ -147,6 +148,13 @@ const DATASETS = {
     decimals: 0,
     color: pm25Color,
   },
+  rain: {
+    url: "https://api-open.data.gov.sg/v2/real-time/api/rainfall",
+    label: "Rainfall (5-min)",
+    unit: "mm",
+    decimals: 1,
+    color: rainColor,
+  },
 };
 const SG_CENTER = [1.3521, 103.8198];
 const SG_BOUNDS = L.latLngBounds([1.15, 103.6], [1.48, 104.1]);
@@ -154,7 +162,7 @@ const NEARBY_COUNT = 10;
 const REFRESH_MS = 5 * 60 * 1000;
 
 // ---------- State ----------
-const stations = { temp: [], pm25: [] };   // each: [{ id, name, lat, lng, value, timestamp }]
+const stations = { temp: [], pm25: [], rain: [] };   // each: [{ id, name, lat, lng, value, timestamp }]
 let mode = "pm25";
 let userLatLng = null;
 let userMarker = null;
@@ -186,6 +194,23 @@ const PM25_BANDS = [
 ];
 function pm25Band(v) { return PM25_BANDS.find(b => v <= b.max); }
 function pm25Color(v) { return pm25Band(v).color; }
+
+// Rainfall (mm per 5 minutes) as shades of blue: pale = dry, deep blue = heavy rain
+const RAIN_BANDS = [
+  { max: 0,        color: "#e0f2fe", label: "None" },
+  { max: 0.5,      color: "#7dd3fc", label: "Light" },
+  { max: 2,        color: "#38bdf8", label: "Light–moderate" },
+  { max: 5,        color: "#0284c7", label: "Moderate" },
+  { max: 10,       color: "#1d4ed8", label: "Heavy" },
+  { max: Infinity, color: "#1e3a8a", label: "Very heavy" },
+];
+function rainBand(v) { return RAIN_BANDS.find(b => v <= b.max) || RAIN_BANDS[RAIN_BANDS.length - 1]; }
+function rainColor(v) { return rainBand(v).color; }
+
+// Pale backgrounds need dark text for legibility
+function textColorFor(key, value) {
+  return key === "rain" && value <= 0.5 ? "#0f172a" : "#fff";
+}
 
 function haversineKm(lat1, lon1, lat2, lon2) {
   const R = 6371, toRad = d => d * Math.PI / 180;
@@ -338,7 +363,7 @@ function renderPins() {
     const color = cfg.color(s.value);
     const icon = L.divIcon({
       className: "",
-      html: `<div class="pin ${nearbyIds.has(s.id) ? "nearby" : ""}" style="background:${color}">${fmtValue(key, s.value)}</div>`,
+      html: `<div class="pin ${nearbyIds.has(s.id) ? "nearby" : ""}" style="background:${color};color:${textColorFor(key, s.value)}">${fmtValue(key, s.value)}</div>`,
       iconSize: null,
     });
     L.marker([s.lat, s.lng], { icon, title: s.name })
@@ -354,6 +379,14 @@ function renderLegend() {
     el.innerHTML = `<div class="title">Air temperature (°C)</div><div class="row">` +
       stops.map(t => `<span><span class="swatch" style="background:${tempColor(t)}"></span>${t}</span>`).join("") +
       `</div>`;
+  } else if (mode === "rain") {
+    el.innerHTML = `<div class="title">Rainfall (mm per 5 min)</div>` +
+      RAIN_BANDS.map((b, i) => {
+        const lo = i === 0 ? "0" : `${RAIN_BANDS[i - 1].max}`;
+        const hi = b.max === Infinity ? "+" : `–${b.max}`;
+        const range = i === 0 ? "0" : (b.max === Infinity ? `>${lo}` : `${lo}${hi}`);
+        return `<div class="row"><span class="swatch" style="background:${b.color}"></span>${range} ${b.label}</div>`;
+      }).join("");
   } else {
     el.innerHTML = `<div class="title">PM2.5 (µg/m³)</div>` +
       PM25_BANDS.map((b, i) => {
@@ -396,7 +429,7 @@ function renderNearby() {
         <div class="name">${escapeHtml(s.name)}</div>
         <div class="dist">${sub}${formatDistance(s.distKm)} away</div>
       </div>
-      <div class="chip" style="background:${color}">${fmtValue(mode, s.value)} ${cfg.unit}</div>
+      <div class="chip" style="background:${color};color:${textColorFor(mode, s.value)}">${fmtValue(mode, s.value)} ${cfg.unit}</div>
     </li>`;
   }).join("");
 
@@ -463,6 +496,7 @@ async function refreshReadings() {
   const fetchers = {
     temp: () => fetchDataset(DATASETS.temp.url),   // station-based
     pm25: () => fetchPm25(DATASETS.pm25.url),      // region-based
+    rain: () => fetchDataset(DATASETS.rain.url),   // station-based, same format as temp
   };
   const results = await Promise.allSettled(keys.map(k => fetchers[k]()));
 
